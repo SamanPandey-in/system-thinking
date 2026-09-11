@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rate Limit Playground — URL Shortener</title>
+    <link rel="stylesheet" href="rate.css">
+</head>
+<body>
+    <main class="page">
+        <section class="container">
+            <div class="content">
+                <div class="top-row">
+                    <div>
+                        <a class="back-link" href="/">← Back to shortener</a>
+                        <h1>Rate limit playground</h1>
+                    </div>
+                    <span class="algo-badge" id="algoBadge">
+                        <span class="dot"></span>
+                        <span id="algoBadgeText">Loading config…</span>
+                    </span>
+                </div>
+                <p class="description">
+                    Every button below fires a <code>POST /api/v1/data</code>
+                    request against server's live rate limiter. All is actual
+                    Redis-backed middleware from <code>/rate-limit</code> accept
+                    or reject requests in real time.
+                </p>
+                <div class="grid">
+                    <!-- Left: controls -->
+                    <div class="panel">
+                        <p class="panel-title">Send traffic</p>
+                        <label class="input-label" for="demoURL">Demo long URL</label>
+                        <input
+                            type="text"
+                            id="demoURL"
+                            value="https://example.com/rate-limit-demo"
+                        >
+                        <div class="btn-row">
+                            <button class="btn btn-primary" id="sendOnce">
+                                Send request
+                            </button>
+                            <button class="btn btn-secondary" id="sendBurst">
+                                Fire burst of 15
+                            </button>
+                            <button class="btn btn-secondary" id="toggleAuto">
+                                Start auto-fire
+                            </button>
+                            <button class="btn btn-secondary" id="clearLog">
+                                Clear log
+                            </button>
+                        </div>
+                        <p class="field-hint" id="hint">
+                            "Auto-fire" sends one every 800ms so you can watch a bucket-style
+                            algorithm refill over time.
+                        </p>
+                    </div>
+                    <!-- Right: live state -->
+                    <div class="panel">
+                        <p class="panel-title">Current allowance</p>
+                        <p class="panel-sub">From the <code>X-RateLimit-*</code> headers on the last response.</p>
+                        <div class="meter-readout">
+                            <div class="value" id="remainingValue">
+                                —<span id="remainingOfLimit"> / —</span>
+                            </div>
+                            <div class="reset" id="resetCountdown"></div>
+                        </div>
+                        <div class="pills" id="pills"></div>
+                        <div class="verdict" id="verdict">
+                            <div class="verdict-icon" id="verdictIcon">·</div>
+                            <div class="verdict-text">
+                                <strong id="verdictTitle">Waiting for first request</strong>
+                                <span id="verdictSubtitle">Send a request to see it evaluated live.</span>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Full width: log -->
+                    <div class="panel log-panel">
+                        <p class="panel-title">Request log</p>
+                        <p class="panel-sub">Newest first. Green = allowed through, red = blocked with a 429.</p>
+                        <div class="log" id="log"></div>
+                    </div>
+                </div>
+                <div class="footer-nav">
+                    Swap the algorithm by editing the import at the top of <code>index.js</code> — this page updates automatically on reload.
+                </div>
+            </div>
+        </section>
+    </main>
+    <script>
+        const demoURLInput = document.getElementById("demoURL");
+        const sendOnceBtn = document.getElementById("sendOnce");
+        const sendBurstBtn = document.getElementById("sendBurst");
+        const toggleAutoBtn = document.getElementById("toggleAuto");
+        const clearLogBtn = document.getElementById("clearLog");
+
+        const algoBadgeText = document.getElementById("algoBadgeText");
+        const remainingValue = document.getElementById("remainingValue");
+        const remainingOfLimit = document.getElementById("remainingOfLimit");
+        const resetCountdown = document.getElementById("resetCountdown");
+        const pillsEl = document.getElementById("pills");
+        const verdictEl = document.getElementById("verdict");
+        const verdictIcon = document.getElementById("verdictIcon");
+        const verdictTitle = document.getElementById("verdictTitle");
+        const verdictSubtitle = document.getElementById("verdictSubtitle");
+        const logEl = document.getElementById("log");
+
+        let knownLimit = null;      // from /api/v1/rate-limit-info, used to size the pill row
+        let resetAt = null;         // ms epoch timestamp, derived from X-RateLimit-Reset
+        let autoFireTimer = null;
+        let requestCounter = 0;
+
+        // ---- Config badge -----------------------------------------------------
+        async function loadInfo() {
+            try {
+                const res = await fetch("/api/v1/rate-limit-info");
+                const data = await res.json();
+
+                knownLimit = data.limit;
+
+                const windowSec = data.windowMs ? Math.round(data.windowMs / 1000) : null;
+                algoBadgeText.textContent = windowSec
+                    ? `${data.algorithm} · ${data.limit} req / ${windowSec}s`
+                    : `${data.algorithm} · limit ${data.limit}`;
+
+                renderPills(knownLimit, knownLimit);
+            } catch (err) {
+                algoBadgeText.textContent = "Could not load rate-limit config";
+            }
+        }
+
+        // ---- Pills / meter ------------------------------------------------------
+        function renderPills(limit, remaining) {
+            if (!limit) return;
+
+            pillsEl.innerHTML = "";
+            const filledCount = Math.max(0, Math.min(limit, Math.round(remaining)));
+
+            for (let i = 0; i < limit; i++) {
+                const pill = document.createElement("div");
+                pill.className = "pill" + (i < filledCount ? " filled" : "");
+                pillsEl.appendChild(pill);
+            }
+        }
+
+        function updateMeter({ limit, remaining, resetSec }) {
+            const effectiveLimit = limit ?? knownLimit;
+
+            remainingValue.textContent = Math.max(0, Math.round(remaining));
+            remainingOfLimit.textContent = ` / ${effectiveLimit ?? "—"}`;
+
+            renderPills(effectiveLimit, remaining);
+
+            if (resetSec !== null && resetSec !== undefined) {
+                resetAt = Date.now() + resetSec * 1000;
+            }
+        }
+
+        function tickCountdown() {
+            if (resetAt === null) {
+                resetCountdown.textContent = "";
+                return;
+            }
+            const msLeft = resetAt - Date.now();
+            if (msLeft <= 0) {
+                resetCountdown.textContent = "window rolled over";
+                resetAt = null;
+                return;
+            }
+            resetCountdown.textContent = `resets in ${(msLeft / 1000).toFixed(1)}s`;
+        }
+        setInterval(tickCountdown, 200);
+
+        // ---- Verdict banner -----------------------------------------------------
+        function updateVerdict(entry) {
+            verdictEl.classList.remove("ok", "blocked");
+            verdictEl.classList.add(entry.blocked ? "blocked" : "ok");
+            verdictIcon.textContent = entry.blocked ? "✕" : "✓";
+
+            if (entry.blocked) {
+                verdictTitle.textContent = `Blocked (429) — request #${entry.n}`;
+                verdictSubtitle.textContent = entry.retryAfter
+                    ? `Retry-After: ${entry.retryAfter}s. The limiter is protecting the endpoint exactly as configured.`
+                    : "The limiter rejected this one.";
+            } else {
+                verdictTitle.textContent = `Allowed (${entry.status}) — request #${entry.n}`;
+                verdictSubtitle.textContent = `${entry.remaining ?? "—"} of ${entry.limit ?? knownLimit ?? "—"} remaining in the current allowance.`;
+            }
+        }
+
+        // ---- Log ------------------------------------------------------------------
+        function addLogEntry(entry) {
+            const row = document.createElement("div");
+            row.className = "log-entry" + (entry.blocked ? " blocked" : "");
+
+            const time = new Date().toLocaleTimeString([], { hour12: false });
+
+            row.innerHTML = `
+                <span class="time">${time}</span>
+                <span class="log-badge ${entry.blocked ? "blocked" : "ok"}">${entry.blocked ? "BLOCKED" : "ALLOWED"}</span>
+                <span class="log-detail">#${entry.n} · ${entry.blocked ? `429 Too Many Requests${entry.retryAfter ? ` · retry in ${entry.retryAfter}s` : ""}` : `${entry.status} OK`}</span>
+                <span class="log-remaining">${entry.remaining ?? "—"} / ${entry.limit ?? knownLimit ?? "—"} left</span>
+            `;
+
+            logEl.appendChild(row);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // ---- Firing requests --------------------------------------------------------
+        async function fireOnce() {
+            requestCounter += 1;
+            const n = requestCounter;
+            const longURL = demoURLInput.value.trim() || "https://example.com/rate-limit-demo";
+
+            try {
+                const res = await fetch("/api/v1/data", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ longURL }),
+                });
+
+                const limitHeader = res.headers.get("X-RateLimit-Limit");
+                const remainingHeader = res.headers.get("X-RateLimit-Remaining");
+                const resetHeader = res.headers.get("X-RateLimit-Reset");
+                const retryAfterHeader = res.headers.get("Retry-After");
+
+                const entry = {
+                    n,
+                    status: res.status,
+                    blocked: res.status === 429,
+                    limit: limitHeader !== null ? Number(limitHeader) : null,
+                    remaining: remainingHeader !== null ? Number(remainingHeader) : null,
+                    resetSec: resetHeader !== null ? Number(resetHeader) : null,
+                    retryAfter: retryAfterHeader !== null ? Number(retryAfterHeader) : null,
+                };
+
+                updateMeter(entry);
+                updateVerdict(entry);
+                addLogEntry(entry);
+            } catch (err) {
+                addLogEntry({ n, blocked: true, status: "ERR", remaining: null, limit: knownLimit });
+                verdictTitle.textContent = "Network error";
+                verdictSubtitle.textContent = err.message;
+            }
+        }
+
+        sendOnceBtn.addEventListener("click", () => fireOnce());
+
+        sendBurstBtn.addEventListener("click", async () => {
+            sendBurstBtn.disabled = true;
+            // Staggered slightly so the browser doesn't coalesce/drop requests,
+            // but fast enough (40ms) to comfortably exceed a 10/60s limit.
+            for (let i = 0; i < 15; i++) {
+                fireOnce();
+                await new Promise((r) => setTimeout(r, 40));
+            }
+            sendBurstBtn.disabled = false;
+        });
+
+        toggleAutoBtn.addEventListener("click", () => {
+            if (autoFireTimer) {
+                clearInterval(autoFireTimer);
+                autoFireTimer = null;
+                toggleAutoBtn.textContent = "Start auto-fire";
+                toggleAutoBtn.classList.remove("active");
+            } else {
+                fireOnce();
+                autoFireTimer = setInterval(fireOnce, 800);
+                toggleAutoBtn.textContent = "Stop auto-fire";
+                toggleAutoBtn.classList.add("active");
+            }
+        });
+
+        clearLogBtn.addEventListener("click", () => {
+            logEl.innerHTML = "";
+            requestCounter = 0;
+            verdictEl.classList.remove("ok", "blocked");
+            verdictTitle.textContent = "Waiting for first request";
+            verdictSubtitle.textContent = "Send a request to see it evaluated live.";
+            verdictIcon.textContent = "·";
+            remainingValue.textContent = "—";
+            remainingOfLimit.textContent = " / —";
+            resetCountdown.textContent = "";
+            resetAt = null;
+            renderPills(knownLimit, knownLimit);
+        });
+
+        loadInfo();
+    </script>
+
+</body>
+</html>
